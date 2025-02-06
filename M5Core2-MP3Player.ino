@@ -124,22 +124,28 @@ void displayPlaylist() {
   // 表示範囲の明示
   int startIdx = offset;
   int endIdx = min(startIdx + maxVisibleItems, totalItems);
+  int screenWidth = M5.Lcd.width();
 
   for (int i=startIdx; i<endIdx; i++) {
     String fname = playlist[i];
     fname = fname.substring(5); // パス短縮
-    //if(fname.length() > 18) fname = fname.substring(0,18)+"..";
+    fname = fname.substring(0, fname.length()-4); // 拡張子短縮
+
+    String displayName = fname;
+    while (M5.Lcd.textWidth(displayName) > screenWidth && displayName.length() > 0) {
+      displayName.remove(displayName.length() - 1);
+    }
     
     int yPos = headerHeight + (i - startIdx) * lineHeight;
     M5.Lcd.setCursor(0, yPos);
     M5.Lcd.setTextWrap(false);  // 画面端での改行の有無（true:有り[初期値], false:無し）※print関数のみ有効
     if(i == currentTrackIndex) {
-      M5.Lcd.fillRect(0, yPos-2, M5.Lcd.width(), lineHeight, BLUE);
+      M5.Lcd.fillRect(0, yPos-2, screenWidth, lineHeight, BLUE);
       M5.Lcd.setTextColor(WHITE);
-      M5.Lcd.printf("> %s", fname.c_str());
+      M5.Lcd.print(displayName);
     } else {
       M5.Lcd.setTextColor(WHITE, BLACK);
-      M5.Lcd.printf("  %s", fname.c_str());
+      M5.Lcd.print(displayName);
     }
   }
   
