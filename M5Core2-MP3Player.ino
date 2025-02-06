@@ -32,7 +32,7 @@ int currentTrackIndex = 0;          // 現在選択中の曲（インデック�
 // --- 追加: 再生中のカセットテープアニメーション用 ---
 float cassetteAngle = 0.0;        // 回転角度（ラジアン）
 unsigned long prevAnimTime = 0;     // アニメーション更新用のタイミング
-const unsigned long animInterval = 30; // アニメーション更新間隔（ミリ秒）
+const unsigned long animInterval = 200; // アニメーション更新間隔（ミリ秒）
 
 // --- 定数: プレイリスト表示用 ---
 const int headerHeight = 32;        // ヘッダー部分の高さ（"Playlist:" 表示用）
@@ -191,8 +191,7 @@ void drawCassetteAnimation() {
 
   // ※必要に応じて、テープの線やその他装飾を追加できます
   // テープの接続線追加
-  M5.Lcd.drawLine(leftReelX + reelRadius, reelY, 
-    rightReelX - reelRadius, reelY, LIGHTGREY);
+  M5.Lcd.drawLine(leftReelX + reelRadius, reelY, rightReelX - reelRadius, reelY, LIGHTGREY);
 }
 
 void setup()
@@ -261,12 +260,11 @@ void loop()
       unsigned long now = millis();
       if (now - prevAnimTime >= animInterval) {
         prevAnimTime = now;
-        cassetteAngle += 0.15;  // 回転速度（ラジアン／更新周期）※調整可能
+        cassetteAngle += 0.3;  // 回転速度（ラジアン／更新周期）※調整可能
         // 上半分は再生情報、下半分にアニメーションを描画
         drawCassetteAnimation();
       }
     }
-    
     if (!mp3->loop()){
       Serial.printf("mp3loop break\n");
       mp3->stop();
