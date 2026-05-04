@@ -1,5 +1,5 @@
 #pragma mark - Depend ESP8266Audio and ESP8266_Spiram libraries
-/* 
+/*
 cd ~/Arduino/libraries
 git clone https://github.com/earlephilhower/ESP8266Audio
 git clone https://github.com/Gianbacchio/ESP8266_Spiram
@@ -12,8 +12,8 @@ git clone https://github.com/Gianbacchio/ESP8266_Spiram
 #include "AudioFileSourceID3.h"
 #include "AudioGeneratorMP3.h"
 #include "AudioOutputI2S.h"
-#include <vector>
 #include <math.h>
+#include <new>
 
 #include <M5StackUpdater.h>
 
@@ -25,8 +25,15 @@ AudioFileSourceID3 *id3 = nullptr;
 int volume = 100;
 enum PLAYMODE { STOP, PLAY } playmode;
 
-// グローバル変数
-std::vector<String> playlist;     // /mp3/ 以下のファイル名（フルパス）
+// プレイリストは固定確保。Arduino String / std::vector<String> を使うと
+// 走査・再生のたびに malloc/free が発生し、Core2 のヒープを断片化させて
+// 数時間で再起動するクラッシュ原因になっていた。
+static const int  MAX_PLAYLIST_FILES = 256;
+static const int  MAX_PATH_LEN       = 128;           // "/mp3/" + filename + NUL
+static const char MP3_FOLDER[]       = "/mp3";
+static const int  MP3_FOLDER_LEN     = sizeof(MP3_FOLDER) - 1;  // "/mp3" → 4
+static char       playlist[MAX_PLAYLIST_FILES][MAX_PATH_LEN];
+static int        playlistCount      = 0;
 int currentTrackIndex = 0;          // 現在選択中の曲（インデックス）
 
 // --- 追加: 再生中のカセットテープアニメーション用 ---
@@ -39,25 +46,42 @@ const int headerHeight = 32;        // ヘッダー部分の高さ（"Playlist:"
 const int lineHeight = 30;          // 1行の高さ（TextSize 2の場合の目安）
 const int maxVisibleItems = 7;
 
+// 大文字小文字を区別しない拡張子チェック。String を作らずに済ませる。
+static bool nameHasExt(const char* name, const char* ext) {
+  if (!name || !ext) return false;
+  size_t nl = strlen(name);
+  size_t el = strlen(ext);
+  if (nl < el) return false;
+  const char* p = name + (nl - el);
+  for (size_t i = 0; i < el; i++) {
+    char a = p[i];
+    char b = ext[i];
+    if (a >= 'A' && a <= 'Z') a = (char)(a + ('a' - 'A'));
+    if (b >= 'A' && b <= 'Z') b = (char)(b + ('a' - 'A'));
+    if (a != b) return false;
+  }
+  return true;
+}
+
 // -------------------------------
 // プレイリスト（/mp3/ 以下の .mp3 ファイル）をスキャンする
 // -------------------------------
 void scanPlaylist() {
-  File root = SD.open("/mp3");
+  playlistCount = 0;
+  File root = SD.open(MP3_FOLDER);
   if (!root) {
     Serial.println("Failed to open /mp3 directory");
     return;
   }
-  while (true) {
+  while (playlistCount < MAX_PLAYLIST_FILES) {
     File entry = root.openNextFile();
-    if (!entry) break; // これ以上ファイルなし
+    if (!entry) break;                                // これ以上ファイルなし
     if (!entry.isDirectory()) {
-      String fname = entry.name();
-      // 拡張子チェック（小文字・大文字両方）
-      if (fname.endsWith(".mp3") || fname.endsWith(".MP3")) {
-        String fpath = "/mp3/" + fname;
-        playlist.push_back(fpath);
-        Serial.println(fpath);
+      const char* name = entry.name();
+      if (name && nameHasExt(name, ".mp3")) {
+        snprintf(playlist[playlistCount], MAX_PATH_LEN, "%s/%s", MP3_FOLDER, name);
+        Serial.println(playlist[playlistCount]);
+        playlistCount++;
       }
     }
     entry.close();
@@ -69,17 +93,40 @@ void scanPlaylist() {
 // 再生開始（選択した曲を再生）
 // -------------------------------
 void startPlayback(int index) {
+  if (index < 0 || index >= playlistCount) return;
   // 既存のファイル／ID3 ソースがあれば解放
-  if(file != nullptr) { delete file; file = nullptr; }
-  if(id3 != nullptr) { delete id3; id3 = nullptr; }
-  String path = playlist[index];
-  file = new AudioFileSourceSD(path.c_str());
+  if (id3  != nullptr) { delete id3;  id3  = nullptr; }
+  if (file != nullptr) { delete file; file = nullptr; }
+  const char* path = playlist[index];
+  file = new (std::nothrow) AudioFileSourceSD(path);
+  if (file == nullptr) {
+    Serial.println("AudioFileSourceSD alloc failed");
+    return;
+  }
   Serial.print("File Path:");
-  Serial.println(path.c_str());
-  id3 = new AudioFileSourceID3(file);
-  mp3->begin(id3, out);
+  Serial.println(path);
+  id3 = new (std::nothrow) AudioFileSourceID3(file);
+  if (id3 == nullptr) {
+    Serial.println("AudioFileSourceID3 alloc failed");
+    delete file; file = nullptr;
+    return;
+  }
+  if (!mp3->begin(id3, out)) {
+    Serial.println("mp3->begin failed");
+    delete id3;  id3  = nullptr;
+    delete file; file = nullptr;
+    return;
+  }
   // 再生開始時は再生情報を画面表示（上部のみ）
   displayPlaybackInfo();
+}
+
+// パスから "/mp3/" を取り除いたファイル名 (拡張子つき) のポインタを返す。
+static const char* trackBasename(int index) {
+  if (index < 0 || index >= playlistCount) return "";
+  const char* p = playlist[index];
+  const char* slash = strrchr(p, '/');
+  return slash ? slash + 1 : p;
 }
 
 // -------------------------------
@@ -90,16 +137,12 @@ void displayPlaybackInfo() {
   M5.Lcd.fillRect(0, 0, M5.Lcd.width(), M5.Lcd.height(), BLACK);
   M5.Lcd.setCursor(0, 0);
   M5.Lcd.setTextSize(0);
-  
+
   // 再生中アイコン（シンプルにテキストで）
   M5.Lcd.println("[Playing]");
-  
+
   // ファイル名表示（"/mp3/" 部分を除く）
-  String fname = playlist[currentTrackIndex];
-  if (fname.startsWith("/")) {
-    fname = fname.substring(5);  // 例："/mp3/" は5文字
-  }
-  M5.Lcd.println(fname);
+  M5.Lcd.println(trackBasename(currentTrackIndex));
   M5.Lcd.printf("Volume: %d%%", volume);
 }
 
@@ -111,13 +154,13 @@ void displayPlaylist() {
   M5.Lcd.fillScreen(BLACK);
   M5.Lcd.setTextSize(0);
   M5.Lcd.setTextColor(WHITE, BLACK);
-  
+
   // ヘッダー部分にタイトルを表示
   M5.Lcd.setCursor(0, 0);
   M5.Lcd.println("Playlist:");
-  
+
   // スクロール計算ロジック改善
-  int totalItems = playlist.size();
+  int totalItems = playlistCount;
   int offset = currentTrackIndex - maxVisibleItems/2;
   offset = constrain(offset, 0, max(totalItems - maxVisibleItems, 0));
 
@@ -127,15 +170,23 @@ void displayPlaylist() {
   int screenWidth = M5.Lcd.width();
 
   for (int i=startIdx; i<endIdx; i++) {
-    String fname = playlist[i];
-    fname = fname.substring(5); // パス短縮
-    fname = fname.substring(0, fname.length()-4); // 拡張子短縮
-
-    String displayName = fname;
-    while (M5.Lcd.textWidth(displayName) > screenWidth && displayName.length() > 0) {
-      displayName.remove(displayName.length() - 1);
+    // 表示用に basename(拡張子なし) を char バッファに作る (heap allocation 無し)
+    const char* base = trackBasename(i);
+    char displayName[MAX_PATH_LEN];
+    strncpy(displayName, base, sizeof(displayName) - 1);
+    displayName[sizeof(displayName) - 1] = '\0';
+    // 末尾の ".mp3" / ".MP3" を取り除く
+    int dlen = (int)strlen(displayName);
+    if (dlen >= 4 && (nameHasExt(displayName, ".mp3"))) {
+      displayName[dlen - 4] = '\0';
     }
-    
+    // 画面幅に収まるよう末尾を切り詰める (heap 不要)
+    while ((int)M5.Lcd.textWidth(displayName) > screenWidth) {
+      int n = (int)strlen(displayName);
+      if (n <= 0) break;
+      displayName[n - 1] = '\0';
+    }
+
     int yPos = headerHeight + (i - startIdx) * lineHeight;
     M5.Lcd.setCursor(0, yPos);
     M5.Lcd.setTextWrap(false);  // 画面端での改行の有無（true:有り[初期値], false:無し）※print関数のみ有効
@@ -148,7 +199,7 @@ void displayPlaylist() {
       M5.Lcd.print(displayName);
     }
   }
-  
+
   // スクロールインジケーター追加
   if(totalItems > maxVisibleItems){
     int scrollHeight = M5.Lcd.height() - headerHeight - 10;
@@ -166,7 +217,7 @@ void drawCassetteAnimation() {
   int animY = M5.Lcd.height()/2;
   int animH = M5.Lcd.height()/2;
   M5.Lcd.fillRect(0, animY, M5.Lcd.width(), animH, BLACK);
-  
+
   // 例として左右に2つの「リール」を描画
   // リールの中心位置と半径（必要に応じて調整）
   int reelRadius = 45;
@@ -176,20 +227,20 @@ void drawCassetteAnimation() {
   int leftReelX = M5.Lcd.width()/4;
   int rightReelX = 3*M5.Lcd.width()/4;
   int reelY = animY + animH/2;
-  
+
   // 各リールを描画
   // 輪郭円
   M5.Lcd.drawCircle(leftReelX, reelY, reelRadius+2, WHITE);
   M5.Lcd.drawCircle(leftReelX, reelY, reelRadius, WHITE);
   M5.Lcd.drawCircle(rightReelX, reelY, reelRadius, WHITE);
-  
+
   // 内部のスポーク（3本）を描画：角度 cassetteAngle を元に計算
   for(int i=0; i<spokeCount; i++){
     float angle = cassetteAngle + i * spokeAngleStep;
     int lx = leftReelX + reelRadius * cos(angle);
     int ly = reelY + reelRadius * sin(angle);
     M5.Lcd.drawLine(leftReelX, reelY, lx, ly, WHITE);
-    
+
     int rx = rightReelX + reelRadius * cos(angle);
     int ry = reelY + reelRadius * sin(angle);
     M5.Lcd.drawLine(rightReelX, reelY, rx, ry, WHITE);
@@ -206,7 +257,7 @@ void setup()
   checkSDUpdater( SD, MENU_BIN, 5000 );
   M5.Axp.SetSpkEnable(true);
 
-  WiFi.mode(WIFI_OFF); 
+  WiFi.mode(WIFI_OFF);
   delay(500);
 
   // 初期表示
@@ -222,7 +273,7 @@ void setup()
 
   // プレイリストをスキャン
   scanPlaylist();
-  if (playlist.size() == 0) {
+  if (playlistCount == 0) {
     M5.Lcd.println("No MP3 files found in /mp3/");
     while(1) delay(100);
   }
@@ -252,14 +303,14 @@ int btncf = false;
 void loop()
 {
   M5.update();
-  
+
   if (playmode == PLAY) {
     // 再生中は再生処理とアニメーション更新を行う
     if (!mp3->isRunning()){
       Serial.printf("MP3 done\n");
       playmode = STOP;
+      if(id3  != nullptr) { delete id3;  id3  = nullptr; }
       if(file != nullptr) { delete file; file = nullptr; }
-      if(id3 != nullptr) { delete id3; id3 = nullptr; }
       displayPlaylist();
     }else{
       // アニメーション更新（一定間隔ごとに更新）
@@ -275,11 +326,11 @@ void loop()
       Serial.printf("mp3loop break\n");
       mp3->stop();
       playmode = STOP;
+      if(id3  != nullptr) { delete id3;  id3  = nullptr; }
       if(file != nullptr) { delete file; file = nullptr; }
-      if(id3 != nullptr) { delete id3; id3 = nullptr; }
       displayPlaylist();
     }
-    
+
     // 再生中のボリューム調整／停止ボタン処理
     if ((btnaf == false) && M5.BtnA.isPressed()) {
       volume -= 5;
@@ -291,7 +342,7 @@ void loop()
     if (btnaf == true){
       if(M5.BtnA.isReleased()) btnaf = false;
     }
-    
+
     if ((btncf == false) && M5.BtnC.isPressed()) {
       volume += 5;
       if (volume > 120) volume = 120; // 上限は 120 とする例
@@ -302,13 +353,13 @@ void loop()
     if (btncf == true){
       if(M5.BtnC.isReleased()) btncf = false;
     }
-    
+
     if (M5.BtnB.isPressed()) {
       while(M5.BtnB.isPressed()) M5.update();
       mp3->stop();
       playmode = STOP;
+      if(id3  != nullptr) { delete id3;  id3  = nullptr; }
       if(file != nullptr) { delete file; file = nullptr; }
-      if(id3 != nullptr) { delete id3; id3 = nullptr; }
       displayPlaylist();
     }
   } else {
@@ -316,13 +367,13 @@ void loop()
     if (M5.BtnA.isPressed()) {
       while(M5.BtnA.isPressed()) M5.update();
       currentTrackIndex--;
-      if (currentTrackIndex < 0) currentTrackIndex = playlist.size() - 1;
+      if (currentTrackIndex < 0) currentTrackIndex = playlistCount - 1;
       displayPlaylist();
     }
     if (M5.BtnC.isPressed()) {
       while(M5.BtnC.isPressed()) M5.update();
       currentTrackIndex++;
-      if (currentTrackIndex >= playlist.size()) currentTrackIndex = 0;
+      if (currentTrackIndex >= playlistCount) currentTrackIndex = 0;
       displayPlaylist();
     }
     if (M5.BtnB.isPressed()) {
